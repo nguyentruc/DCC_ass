@@ -23,17 +23,17 @@
 void SystemClock_Config(void);
 void SPI_Init(void);
 void TIMER_Init(void);
-uint8_t newConnect(void);
 void receiveFunc(void);
 void transmitFunc(void);
 void sendACK(uint8_t, uint8_t);
 void eepromWrite(void);
 
-uint8_t sendReceive;
+uint8_t isTransmit, timerOn;
+uint8_t timeout_flag;
 uint8_t frameBuffer[WINDOW_SIZE][DATA_SIZE + 5];
 uint8_t sendBuffer[WINDOW_SIZE][DATA_SIZE + 5];
 uint8_t receiveByte, nByte, seq_number;
-uint32_t head, tail;
+uint32_t headReceive, tailReceive, headTransmit, tailTransmit;
 
 SPI_HandleTypeDef spiHandle;
 TIM_HandleTypeDef timerHandle;
@@ -54,30 +54,48 @@ int main(void)
 	bboard_usart1_init(115200);
 	bboard_led_green_init();
 	bboard_led_red_init();
-	head = 0;
-	tail = 0;
+	headReceive = 0;
+	tailReceive = 0;
 	nByte = 0;
 	seq_number = 0;
-	sendReceive = 0;
 	
 	HAL_UART_Receive_IT(&bboard_uart1_handle, &receiveByte, 1);
 	
 	/* Infinite loop */
 	while (1)
 	{
-		switch (sendReceive)
+		if (headReceive < tailReceive)
 		{
-			case 0:
-				if (head < tail)
+			receiveFunc();
+		}
+		
+		if (isTransmit)
+		{
+			if (tailTransmit - headTransmit < WINDOW_SIZE)
+			{
+				transmitFunc();
+			}
+			else 
+			{
+				if (!timerOn)
 				{
-					receiveFunc();
+					timerOn = 1;
+					timeout_flag = 0;
+					__HAL_TIM_CLEAR_IT(&timerHandle, TIM_IT_UPDATE);
+					__HAL_TIM_CLEAR_FLAG(&timerHandle, TIM_FLAG_UPDATE);
+					__HAL_TIM_SET_COUNTER(&timerHandle, 0);
+					HAL_TIM_Base_Start_IT(&timerHandle);
 				}
-				break;
-			case 1:
-				if (head < tail)
+				if (timeout_flag)
 				{
-					transmitFunc();
+					sendACK(1, RR);
+					timeout_flag = 0;
+					__HAL_TIM_CLEAR_IT(&timerHandle, TIM_IT_UPDATE);
+					__HAL_TIM_CLEAR_FLAG(&timerHandle, TIM_FLAG_UPDATE);
+					__HAL_TIM_SET_COUNTER(&timerHandle, 0);
+					HAL_TIM_Base_Start_IT(&timerHandle);
 				}
+			}
 		}
 	}
 }
@@ -101,8 +119,8 @@ inline void receiveFunc()
 	uint8_t frame[I_FRAME_SIZE];
 	
 	uint16_t myCrc, receiveCrc;
-	strcpy((char *)frame, (char *)frameBuffer[head % WINDOW_SIZE]);
-	head++;
+	strcpy((char *)frame, (char *)frameBuffer[headReceive % WINDOW_SIZE]);
+	headReceive++;
 	
 	//I-frame
 	if (frame[1] >> 7 == 0)
@@ -147,6 +165,18 @@ inline void receiveFunc()
 			//RR seq_number
 			sendACK(0, RR);
 		}
+		else//if ACK (in transmit mode)
+		{
+			if (frame[1] >> 4 == RR)//receive ready
+			{
+				uint8_t seq_receive = frame[1] & 0x07;
+				while ((sendBuffer[headTransmit % WINDOW_SIZE][1] & 0x07) != seq_receive) headTransmit++;
+			}
+			else
+			{
+				//send back from seq_receive
+			}
+		}
 	}
 	else //U-frame
 	{
@@ -173,6 +203,11 @@ inline void receiveFunc()
 
 inline void transmitFunc()
 {
+	HAL_TIM_Base_Stop_IT(&timerHandle);
+	timerOn = 0;
+	//add data to buffer
+	//send data
+
 }
 
 inline void eepromWrite()
@@ -302,15 +337,16 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
 	if (huart->Instance == USART1)
 	{
-		frameBuffer[tail % WINDOW_SIZE][nByte] = receiveByte;
+		frameBuffer[tailReceive % WINDOW_SIZE][nByte] = receiveByte;
 		nByte = (nByte + 1) % (DATA_SIZE + 5);
 		if (receiveByte == STOP_BYTE || nByte == 0)
 		{
-			tail++;
+			tailReceive++;
 			nByte = 0;
 		}
+		if (tailReceive - headReceive < WINDOW_SIZE) HAL_UART_Receive_IT(&bboard_uart1_handle, &receiveByte, 1);
 	}
-	HAL_UART_Receive_IT(&bboard_uart1_handle, &receiveByte, 1);
+	
 }
 
 
