@@ -27,13 +27,15 @@ void receiveFunc(void);
 void transmitFunc(void);
 void sendACK(uint8_t, uint8_t);
 void eepromWrite(void);
+void eepromRead(void);
 
-uint8_t isTransmit, timerOn;
+uint8_t isTransmit, timerOn, isStop;
 uint8_t timeout_flag;
 uint8_t frameBuffer[WINDOW_SIZE][DATA_SIZE + 5];
 uint8_t sendBuffer[WINDOW_SIZE][DATA_SIZE + 5];
 uint8_t receiveByte, nByte, seq_number;
-uint32_t headReceive, tailReceive, headTransmit, tailTransmit;
+uint8_t epprom[256];
+uint32_t headReceive, tailReceive, headTransmit, tailTransmit, toTransmit;
 
 SPI_HandleTypeDef spiHandle;
 TIM_HandleTypeDef timerHandle;
@@ -58,12 +60,16 @@ int main(void)
 	tailReceive = 0;
 	nByte = 0;
 	seq_number = 0;
+	isTransmit = 0;
+	isStop = 0;
 	
 	HAL_UART_Receive_IT(&bboard_uart1_handle, &receiveByte, 1);
 	
 	/* Infinite loop */
 	while (1)
 	{
+		if (isStop) break;
+		
 		if (headReceive < tailReceive)
 		{
 			receiveFunc();
@@ -71,12 +77,14 @@ int main(void)
 		
 		if (isTransmit)
 		{
-			if (tailTransmit - headTransmit < WINDOW_SIZE)
+			//not full buffer or there is still data to send
+			if (tailTransmit - headTransmit < WINDOW_SIZE || toTransmit < tailTransmit) 
 			{
 				transmitFunc();
 			}
 			else 
 			{
+				// if timer is already on -> wait for timeout, else initialize the timer
 				if (!timerOn)
 				{
 					timerOn = 1;
@@ -163,18 +171,15 @@ inline void receiveFunc()
 		if ( ((frame[1] >> 3) & 0x01) == 1) //poll
 		{
 			//RR seq_number
-			sendACK(0, RR);
+			sendACK(0, REJ);
 		}
 		else//if ACK (in transmit mode)
 		{
-			if (frame[1] >> 4 == RR)//receive ready
+			uint8_t seq_receive = frame[1] & 0x07;
+			while ((sendBuffer[headTransmit % WINDOW_SIZE][1] & 0x07) != seq_receive) headTransmit++;
+			if (frame[1] >> 4 == REJ)//receive ready
 			{
-				uint8_t seq_receive = frame[1] & 0x07;
-				while ((sendBuffer[headTransmit % WINDOW_SIZE][1] & 0x07) != seq_receive) headTransmit++;
-			}
-			else
-			{
-				//send back from seq_receive
+				while ((sendBuffer[toTransmit % WINDOW_SIZE][1] & 0x07) != seq_receive) toTransmit--;
 			}
 		}
 	}
@@ -193,10 +198,31 @@ inline void receiveFunc()
 		if (((frame[1] >> 5) & 0x01) == 1)
 		{	
 			//stop
+			isStop = 1;
+			//finalize the data
 		}
 		else //if start (on ARM only!)
 		{
 			//check PC2ARM or ARM2PC, then initialize the buffer
+			if (frame[1] == PC2ARM)
+			{
+				isTransmit = 0;
+				headReceive = 0;
+				tailReceive = 0;
+				nByte = 0;
+				seq_number = 0;
+
+				sendACK(0, RR);
+				HAL_UART_Receive_IT(&bboard_uart1_handle, &receiveByte, 1);
+			}
+			else
+			{
+				headTransmit = 0;
+				tailTransmit = 0;
+				toTransmit = headTransmit;
+				seq_number = 0;
+				isTransmit = 1;
+			}
 		}
  	}
 }
@@ -205,9 +231,23 @@ inline void transmitFunc()
 {
 	HAL_TIM_Base_Stop_IT(&timerHandle);
 	timerOn = 0;
-	//add data to buffer
-	//send data
 
+	//send data
+	if (toTransmit < tailTransmit)
+	{
+		HAL_UART_Transmit(&bboard_uart1_handle, sendBuffer[toTransmit % WINDOW_SIZE], I_FRAME_SIZE, 0xFFFFFFFF);
+		toTransmit++;
+	}
+	
+	while (tailTransmit - headTransmit < WINDOW_SIZE)
+	{
+		//add data to buffer until buffer is full
+		tailTransmit++;
+	}
+}
+
+inline void eepromRead()
+{
 }
 
 inline void eepromWrite()
