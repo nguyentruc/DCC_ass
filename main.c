@@ -5,7 +5,7 @@
 #include "stm32f1xx_hal.h"
 #include "crc.h"
 
-
+#define SPI_SIZE 256
 #define DATA_SIZE 4
 #define BAUDRATE 115200
 #define WINDOW_SIZE 4
@@ -26,7 +26,7 @@ void TIMER_Init(void);
 void receiveFunc(void);
 void transmitFunc(void);
 void sendACK(uint8_t, uint8_t);
-void eepromWrite(void);
+void eepromWrite(uint8_t *);
 void eepromRead(void);
 
 uint8_t isTransmit, timerOn, isStop;
@@ -34,7 +34,7 @@ uint8_t timeout_flag;
 uint8_t frameBuffer[WINDOW_SIZE][DATA_SIZE + 5];
 uint8_t sendBuffer[WINDOW_SIZE][DATA_SIZE + 5];
 uint8_t receiveByte, nByte, seq_number;
-uint8_t epprom[256];
+uint8_t eeprom[256];
 uint32_t headReceive, tailReceive, headTransmit, tailTransmit, toTransmit;
 
 SPI_HandleTypeDef spiHandle;
@@ -150,7 +150,7 @@ inline void receiveFunc()
 		}
 				
 		//write to EPPROM
-		eepromWrite();
+		eepromWrite(&frame[2]);
 		//new sequence number
 		seq_number =  (seq_number + 1) % (MAX_SEQUENCE + 1);
 		//RR
@@ -242,16 +242,40 @@ inline void transmitFunc()
 	while (tailTransmit - headTransmit < WINDOW_SIZE)
 	{
 		//add data to buffer until buffer is full
-		tailTransmit++;
+		eepromRead();
 	}
 }
 
 inline void eepromRead()
 {
+	static int addr = 0;
+	uint16_t crc;
+	uint8_t data[DATA_SIZE];
+	
+	strncpy((char *)data, (char *)&eeprom[addr], DATA_SIZE);
+	
+	sendBuffer[tailTransmit % WINDOW_SIZE][0] = START_BYTE;
+	sendBuffer[tailTransmit % WINDOW_SIZE][1] = (seq_number << 4);
+	strncpy((char *)&sendBuffer[tailTransmit % WINDOW_SIZE][2], (char *)data, DATA_SIZE);
+	crc = crcFast(sendBuffer[tailTransmit % WINDOW_SIZE], I_FRAME_SIZE - 3);
+	sendBuffer[tailTransmit % WINDOW_SIZE][I_FRAME_SIZE - 3] = crc & 0x00FF;
+	sendBuffer[tailTransmit % WINDOW_SIZE][I_FRAME_SIZE - 2] = crc >> 8;
+	sendBuffer[tailTransmit % WINDOW_SIZE][I_FRAME_SIZE - 1] = STOP_BYTE;
+	
+	tailTransmit++;
+	addr = (addr + DATA_SIZE) % SPI_SIZE;
 }
 
-inline void eepromWrite()
+inline void eepromWrite(uint8_t *data)
 {
+	static int addr = 0;
+	uint8_t cnt = 0;
+	while (cnt < DATA_SIZE)
+	{
+		eeprom[addr] = data[cnt];
+		addr++;
+		cnt++;
+	}
 }
 
 inline void SPI_Init()
