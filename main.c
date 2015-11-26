@@ -4,6 +4,7 @@
 #include "bboard_system.h"
 #include "stm32f1xx_hal.h"
 #include "crc.h"
+#include "spi_eeprom.h"
 
 #define SPI_SIZE 256
 #define DATA_SIZE 4
@@ -18,7 +19,7 @@
 #define ARM2PC 0xD0
 #define S_FRAME_SIZE 5
 #define I_FRAME_SIZE (DATA_SIZE + S_FRAME_SIZE) 
-#define TIMEOUT_FREQ (BAUDRATE / (4 * I_FRAME_SIZE))
+#define TIMEOUT_FREQ 5000
 
 void SystemClock_Config(void);
 void SPI_Init(void);
@@ -26,16 +27,17 @@ void TIMER_Init(void);
 void receiveFunc(void);
 void transmitFunc(void);
 void sendACK(uint8_t, uint8_t);
-void eepromWrite(uint8_t *);
-void eepromRead(void);
+void dataWrite(uint8_t *);
+uint8_t dataRead(void);
 
-uint8_t isTransmit, timerOn, isStop;
+uint8_t isTransmit, timerOn, isStop, finalData;
 uint8_t timeout_flag;
 uint8_t frameBuffer[WINDOW_SIZE][DATA_SIZE + 5];
 uint8_t sendBuffer[WINDOW_SIZE][DATA_SIZE + 5];
 uint8_t receiveByte, nByte, seq_number;
 uint8_t eeprom[256];
 uint32_t headReceive, tailReceive, headTransmit, tailTransmit, toTransmit;
+uint16_t address;
 
 SPI_HandleTypeDef spiHandle;
 TIM_HandleTypeDef timerHandle;
@@ -46,14 +48,17 @@ TIM_HandleTypeDef timerHandle;
   */
 int main(void)
 {
+	HAL_Init();
 	/* Configure the system clock to 72 MHz */
 	SystemClock_Config();
     
     /* Init CRC */
     crcInit();
+	bboard_usart2_init(921600);
+	SPI_Init();
+	TIMER_Init();
 	
-	HAL_Init();
-	bboard_usart1_init(115200);
+	bboard_usart1_init(BAUDRATE);
 	bboard_led_green_init();
 	bboard_led_red_init();
 	headReceive = 0;
@@ -119,8 +124,9 @@ inline void sendACK(uint8_t poll, uint8_t status)
 	ack[2] = myCrc & 0x00FF;
 	ack[3] = myCrc >> 8;
 	ack[4] = STOP_BYTE;
-	HAL_UART_Transmit_IT(&bboard_uart1_handle, ack, S_FRAME_SIZE);
+	HAL_UART_Transmit(&bboard_uart1_handle, ack, S_FRAME_SIZE, 0xFFFFFFFF);
 }
+
 
 inline void receiveFunc()
 {
@@ -150,7 +156,7 @@ inline void receiveFunc()
 		}
 				
 		//write to EPPROM
-		eepromWrite(&frame[2]);
+		dataWrite(&frame[2]);
 		//new sequence number
 		seq_number =  (seq_number + 1) % (MAX_SEQUENCE + 1);
 		//RR
@@ -171,13 +177,14 @@ inline void receiveFunc()
 		if ( ((frame[1] >> 3) & 0x01) == 1) //poll
 		{
 			//RR seq_number
-			sendACK(0, REJ);
+			sendACK(0, RR);
 		}
 		else//if ACK (in transmit mode)
 		{
 			uint8_t seq_receive = frame[1] & 0x07;
-			while ((sendBuffer[headTransmit % WINDOW_SIZE][1] & 0x07) != seq_receive) headTransmit++;
-			if (frame[1] >> 4 == REJ)//receive ready
+			while (((sendBuffer[headTransmit % WINDOW_SIZE][1] & 0x07) != seq_receive) && headTransmit < tailTransmit) 
+				headTransmit++;
+			if (((frame[1] >> 4) & 0x03) == REJ)//receive ready
 			{
 				while ((sendBuffer[toTransmit % WINDOW_SIZE][1] & 0x07) != seq_receive) toTransmit--;
 			}
@@ -213,15 +220,21 @@ inline void receiveFunc()
 				seq_number = 0;
 
 				sendACK(0, RR);
-				HAL_UART_Receive_IT(&bboard_uart1_handle, &receiveByte, 1);
+				//HAL_UART_Receive_IT(&bboard_uart1_handle, &receiveByte, 1);
 			}
 			else
 			{
+				headReceive = 0;
+				tailReceive = 0;
+				nByte = 0;
 				headTransmit = 0;
 				tailTransmit = 0;
 				toTransmit = headTransmit;
 				seq_number = 0;
 				isTransmit = 1;
+				finalData = 0;
+				uint8_t Uframe = ARM2PC;
+				HAL_UART_Transmit(&bboard_uart1_handle, &Uframe, 1, 0xFFFFFFFF);
 			}
 		}
  	}
@@ -231,51 +244,67 @@ inline void transmitFunc()
 {
 	HAL_TIM_Base_Stop_IT(&timerHandle);
 	timerOn = 0;
+	
+	if (finalData && (tailTransmit == headTransmit)) isStop = 1;
 
 	//send data
 	if (toTransmit < tailTransmit)
 	{
 		HAL_UART_Transmit(&bboard_uart1_handle, sendBuffer[toTransmit % WINDOW_SIZE], I_FRAME_SIZE, 0xFFFFFFFF);
 		toTransmit++;
-	}
+	}		
 	
 	while (tailTransmit - headTransmit < WINDOW_SIZE)
 	{
 		//add data to buffer until buffer is full
-		eepromRead();
+		if (dataRead() == 0) break;
 	}
 }
 
-inline void eepromRead()
+inline uint8_t dataRead()
 {
-	static int addr = 0;
 	uint16_t crc;
 	uint8_t data[DATA_SIZE];
+	uint8_t size = DATA_SIZE;
+	uint8_t *ptr;
 	
-	strncpy((char *)data, (char *)&eeprom[addr], DATA_SIZE);
+	if (finalData) 
+	{
+		//stop frame
+		return 0;
+	}
+	
+	memset(data, NULL, DATA_SIZE);
+	
+	eepromRead(&spiHandle, data, DATA_SIZE, address);
+	printf("read data: %.*s\n", DATA_SIZE, data);
+	
+	ptr = (uint8_t *)strchr((char *)data, NULL);
+	if (ptr - data  < DATA_SIZE)
+	{
+		finalData = 1;
+		size = ptr - data + 1;
+	}
 	
 	sendBuffer[tailTransmit % WINDOW_SIZE][0] = START_BYTE;
 	sendBuffer[tailTransmit % WINDOW_SIZE][1] = (seq_number << 4);
-	strncpy((char *)&sendBuffer[tailTransmit % WINDOW_SIZE][2], (char *)data, DATA_SIZE);
+	strncpy((char *)&sendBuffer[tailTransmit % WINDOW_SIZE][2], (char *)data, size);
 	crc = crcFast(sendBuffer[tailTransmit % WINDOW_SIZE], I_FRAME_SIZE - 3);
 	sendBuffer[tailTransmit % WINDOW_SIZE][I_FRAME_SIZE - 3] = crc & 0x00FF;
 	sendBuffer[tailTransmit % WINDOW_SIZE][I_FRAME_SIZE - 2] = crc >> 8;
 	sendBuffer[tailTransmit % WINDOW_SIZE][I_FRAME_SIZE - 1] = STOP_BYTE;
 	
+	seq_number =  (seq_number + 1) % (MAX_SEQUENCE + 1);
 	tailTransmit++;
-	addr = (addr + DATA_SIZE) % SPI_SIZE;
+	address = address + DATA_SIZE;
+	
+	return 1;
 }
 
-inline void eepromWrite(uint8_t *data)
+inline void dataWrite(uint8_t *data)
 {
-	static int addr = 0;
-	uint8_t cnt = 0;
-	while (cnt < DATA_SIZE)
-	{
-		eeprom[addr] = data[cnt];
-		addr++;
-		cnt++;
-	}
+	printf("data: %.*s\n", DATA_SIZE, data);
+	eepromWrite(&spiHandle, data, DATA_SIZE, address);
 }
 
 inline void SPI_Init()
@@ -383,11 +412,12 @@ inline void SystemClock_Config(void)
 	  while(1);
 	}
 
-	clkinitstruct.ClockType = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2 | RCC_CLOCKTYPE_SYSCLK;
+	clkinitstruct.ClockType = RCC_CLOCKTYPE_SYSCLK | RCC_CLOCKTYPE_HCLK 
+        | RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
 	clkinitstruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
 	clkinitstruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
-	clkinitstruct.APB1CLKDivider = RCC_SYSCLK_DIV2;
-	clkinitstruct.APB2CLKDivider = RCC_SYSCLK_DIV1;
+	clkinitstruct.APB1CLKDivider = RCC_HCLK_DIV2;
+	clkinitstruct.APB2CLKDivider = RCC_HCLK_DIV1;
 	if (HAL_RCC_ClockConfig(&clkinitstruct, FLASH_LATENCY_2) != HAL_OK)
 	{
 	  //error
@@ -411,6 +441,21 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 		if (tailReceive - headReceive < WINDOW_SIZE) HAL_UART_Receive_IT(&bboard_uart1_handle, &receiveByte, 1);
 	}
 	
+}
+
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) 
+{
+	timeout_flag = 1;
+	printf("timeout...\n");
+	if (HAL_TIM_Base_Stop_IT(&timerHandle) != HAL_OK) 
+	{
+        printf("Err: HAL_TIM_Base_Stop_IT failed.\n");
+    }
+}
+
+void TIM3_IRQHandler(void)
+{
+	HAL_TIM_IRQHandler(&timerHandle);
 }
 
 
