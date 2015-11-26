@@ -161,6 +161,8 @@ inline void receiveFunc()
 		seq_number =  (seq_number + 1) % (MAX_SEQUENCE + 1);
 		//RR
 		sendACK(0, RR);
+		
+		if (memchr(&frame[2], NULL, DATA_SIZE) != NULL) isStop = 1;
 	}
 	else if (frame[1] >> 6 == 0x02) //S-Frame
 	{
@@ -220,6 +222,7 @@ inline void receiveFunc()
 				seq_number = 0;
 
 				sendACK(0, RR);
+				printf("Start receive\n");
 				//HAL_UART_Receive_IT(&bboard_uart1_handle, &receiveByte, 1);
 			}
 			else
@@ -235,6 +238,7 @@ inline void receiveFunc()
 				finalData = 0;
 				uint8_t Uframe = ARM2PC;
 				HAL_UART_Transmit(&bboard_uart1_handle, &Uframe, 1, 0xFFFFFFFF);
+				printf("Start transmit\n");
 			}
 		}
  	}
@@ -265,8 +269,7 @@ inline uint8_t dataRead()
 {
 	uint16_t crc;
 	uint8_t data[DATA_SIZE];
-	uint8_t size = DATA_SIZE;
-	uint8_t *ptr;
+	void *ptr;
 	
 	if (finalData) 
 	{
@@ -279,16 +282,15 @@ inline uint8_t dataRead()
 	eepromRead(&spiHandle, data, DATA_SIZE, address);
 	printf("read data: %.*s\n", DATA_SIZE, data);
 	
-	ptr = (uint8_t *)strchr((char *)data, NULL);
-	if (ptr - data  < DATA_SIZE)
+	ptr = memchr(data, NULL, DATA_SIZE);
+	if (ptr != NULL)
 	{
 		finalData = 1;
-		size = ptr - data + 1;
 	}
 	
 	sendBuffer[tailTransmit % WINDOW_SIZE][0] = START_BYTE;
 	sendBuffer[tailTransmit % WINDOW_SIZE][1] = (seq_number << 4);
-	strncpy((char *)&sendBuffer[tailTransmit % WINDOW_SIZE][2], (char *)data, size);
+	strncpy((char *)&sendBuffer[tailTransmit % WINDOW_SIZE][2], (char *)data, DATA_SIZE);
 	crc = crcFast(sendBuffer[tailTransmit % WINDOW_SIZE], I_FRAME_SIZE - 3);
 	sendBuffer[tailTransmit % WINDOW_SIZE][I_FRAME_SIZE - 3] = crc & 0x00FF;
 	sendBuffer[tailTransmit % WINDOW_SIZE][I_FRAME_SIZE - 2] = crc >> 8;
